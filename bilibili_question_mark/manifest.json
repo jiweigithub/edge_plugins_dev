@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Bilibili 问号弹幕助手",
+  "version": "1.0.0",
+  "description": "在Bilibili视频页面添加问号弹幕按钮，支持点击发送和长按连发",
+  "permissions": [],
+  "host_permissions": [
+    "*://*.bilibili.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["*://www.bilibili.com/video/*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_end"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.svg",
+    "48": "icons/icon48.svg",
+    "128": "icons/icon128.svg"
+  }
+}
