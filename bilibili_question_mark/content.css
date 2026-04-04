@@ -85,3 +85,14 @@
   60% { transform: translateX(-2px); }
   80% { transform: translateX(2px); }
 }
+
+.question-error {
+  animation: errorFlash 1s ease;
+}
+
+@keyframes errorFlash {
+  0%, 100% { color: #61666d; }
+  25% { color: #f44336; }
+  50% { color: #61666d; }
+  75% { color: #f44336; }
+}

@@ -5,16 +5,21 @@
   const LONG_PRESS_INTERVAL = 100;
   const COUNT_REFRESH_INTERVAL = 5 * 60 * 1000;
   const SEND_COOLDOWN = 5000;
+  const DANMAKU_SEGMENT_DURATION = 60;
 
   let pressTimer = null;
   let pressStartTime = 0;
   let questionCount = 0;
-  let isLongPress = false;
 
   let cachedCount = 0;
   let lastFetchTime = 0;
   let currentBvid = null;
   let lastSendTime = 0;
+
+  let observer = null;
+  let observerTarget = null;
+  let ensureButtonDebounced = null;
+  let countDisplayRef = null;
 
   function getVideoInfo() {
     const url = window.location.href;
@@ -65,23 +70,92 @@
     const videoInfo = await getCid(bvid);
     if (!videoInfo) return 0;
 
+    const cid = videoInfo.cid;
     try {
-      const res = await fetch(`https://comment.bilibili.com/${videoInfo.cid}.xml`, {
+      const res = await fetch(`https://api.bilibili.com/x/v2/dm/web/seg.so?type=1&oid=${cid}&segment_index=1`, {
+        credentials: 'include'
+      });
+      if (!res.ok) return 0;
+      const buffer = await res.arrayBuffer();
+      return countQuestionMarksInProto(buffer);
+    } catch (e) {
+      return fetchDanmakuCountFallback(cid);
+    }
+  }
+
+  function countQuestionMarksInProto(buffer) {
+    const data = new Uint8Array(buffer);
+    let count = 0;
+    let i = 0;
+    while (i < data.length) {
+      if (data[i] === 0x0a) {
+        const len = data[i + 1];
+        const start = i + 2;
+        const end = start + len;
+        if (end <= data.length) {
+          const segment = data.subarray(start, end);
+          count += countQuestionMarksInSegment(segment);
+        }
+        i = end;
+      } else {
+        i++;
+      }
+    }
+    return count;
+  }
+
+  function countQuestionMarksInSegment(buffer) {
+    const data = new Uint8Array(buffer);
+    let count = 0;
+    let i = 0;
+    while (i < data.length) {
+      if (data[i] === 0x0a) {
+        const len = data[i + 1];
+        const start = i + 2;
+        const end = start + len;
+        if (end <= data.length) {
+          const danmakuBytes = data.subarray(start, end);
+          count += countQuestionMarksInDanmaku(danmakuBytes);
+        }
+        i = end;
+      } else {
+        i++;
+      }
+    }
+    return count;
+  }
+
+  function countQuestionMarksInDanmaku(bytes) {
+    try {
+      const decoder = new TextDecoder('utf-8', { fatal: false });
+      const text = decoder.decode(bytes);
+      let count = 0;
+      for (const ch of text) {
+        if (ch === '?' || ch === '？') count++;
+      }
+      return count;
+    } catch {
+      return 0;
+    }
+  }
+
+  async function fetchDanmakuCountFallback(cid) {
+    try {
+      const res = await fetch(`https://comment.bilibili.com/${cid}.xml`, {
         credentials: 'include'
       });
       const text = await res.text();
-      const parser = new DOMParser();
-      const xml = parser.parseFromString(text, 'text/xml');
-      const danmakus = xml.querySelectorAll('d');
       let count = 0;
-      danmakus.forEach(d => {
-        const content = d.textContent;
+      const regex = /<d[^>]*>([^<]*)<\/d>/g;
+      let match;
+      while ((match = regex.exec(text)) !== null) {
+        const content = match[1];
         for (const ch of content) {
           if (ch === '?' || ch === '？') count++;
         }
-      });
+      }
       return count;
-    } catch (e) {
+    } catch {
       return 0;
     }
   }
@@ -156,9 +230,12 @@
         nativeInputValueSetter.call(input, text);
         input.dispatchEvent(new Event('input', { bubbles: true }));
         input.dispatchEvent(new Event('change', { bubbles: true }));
-      } else {
-        input.textContent = text;
-        input.dispatchEvent(new Event('input', { bubbles: true }));
+      } else if (input.isContentEditable) {
+        const success = document.execCommand('insertText', false, text);
+        if (!success) {
+          input.textContent = text;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+        }
       }
 
       await new Promise(r => setTimeout(r, 100));
@@ -167,12 +244,13 @@
       if (sendBtn) {
         sendBtn.click();
       } else {
-        input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-        input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+        input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+        input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
       }
 
       return true;
     } catch (e) {
+      console.warn('[Bilibili ?] Failed to send danmaku:', e);
       return false;
     }
   }
@@ -191,7 +269,12 @@
     setTimeout(() => btn.classList.remove('question-clicked'), 300);
   }
 
-  async function handlePress(btn, countDisplay) {
+  function showErrorAnimation(btn) {
+    btn.classList.add('question-error');
+    setTimeout(() => btn.classList.remove('question-error'), 1000);
+  }
+
+  async function handlePress(btn) {
     const isLoggedIn = await checkLogin();
     if (!isLoggedIn) {
       triggerLoginDialog();
@@ -208,21 +291,17 @@
 
     showClickAnimation(btn);
 
-    let sentCount = 1;
-    let success = false;
-    if (isLongPress && questionCount > 0) {
-      const questionMarks = QUESTION_MARK.repeat(questionCount);
-      success = await sendDanmaku(questionMarks);
-      sentCount = questionCount;
-    } else {
-      success = await sendDanmaku(QUESTION_MARK);
-    }
+    const sendCount = questionCount > 0 ? questionCount : 1;
+    const questionMarks = QUESTION_MARK.repeat(sendCount);
+    const success = await sendDanmaku(questionMarks);
 
     if (success) {
       lastSendTime = Date.now();
-      showCountAnimation(btn, sentCount);
-      const newCount = addLocalCount(sentCount);
-      countDisplay.textContent = newCount;
+      showCountAnimation(btn, sendCount);
+      const newCount = addLocalCount(sendCount);
+      if (countDisplayRef) countDisplayRef.textContent = newCount;
+    } else {
+      showErrorAnimation(btn);
     }
   }
 
@@ -237,20 +316,17 @@
       <span class="question-count video-toolbar-item-text">0</span>
     `;
 
-    const icon = btn.querySelector('.question-icon');
-    const countDisplay = btn.querySelector('.question-count');
+    countDisplayRef = btn.querySelector('.question-count');
 
     btn.addEventListener('mousedown', (e) => {
       e.preventDefault();
       e.stopPropagation();
       pressStartTime = Date.now();
       questionCount = 0;
-      isLongPress = false;
 
       pressTimer = setInterval(() => {
-        isLongPress = true;
         questionCount++;
-        countDisplay.textContent = '?' + (questionCount > 1 ? `x${questionCount}` : '');
+        countDisplayRef.textContent = '?' + (questionCount > 1 ? `x${questionCount}` : '');
       }, LONG_PRESS_INTERVAL);
     });
 
@@ -258,11 +334,10 @@
       e.preventDefault();
       e.stopPropagation();
       clearInterval(pressTimer);
-      if (Date.now() - pressStartTime < LONG_PRESS_INTERVAL) {
+      if (questionCount === 0) {
         questionCount = 1;
-        isLongPress = false;
       }
-      handlePress(btn, countDisplay);
+      handlePress(btn);
     });
 
     btn.addEventListener('mouseleave', () => {
@@ -293,58 +368,69 @@
     const videoInfo = getVideoInfo();
     if (!videoInfo) return;
     const count = await getDanmakuCount(videoInfo.bvid);
-    const countDisplay = document.querySelector('.question-btn-wrapper .question-count');
-    if (countDisplay) countDisplay.textContent = count;
+    if (countDisplayRef) countDisplayRef.textContent = count;
   }
 
-  let injecting = false;
-
-  function tryInjectButton() {
-    if (injecting) return true;
+  function injectButton() {
     if (document.querySelector('.question-btn-wrapper')) return true;
     const actionBar = findActionBar();
     if (!actionBar) return false;
 
-    injecting = true;
     const wrapper = document.createElement('div');
     wrapper.className = 'toolbar-left-item-wrap question-btn-wrapper';
     const btn = createQuestionButton();
     wrapper.appendChild(btn);
     actionBar.appendChild(wrapper);
-    injecting = false;
+
+    if (!observerTarget) {
+      observerTarget = actionBar;
+      if (observer) observer.disconnect();
+      observer.observe(actionBar, { childList: true, subtree: true });
+    }
+
     updateCountDisplay();
     return true;
+  }
+
+  function debounce(fn, delay) {
+    let timer = null;
+    return function(...args) {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => fn.apply(this, args), delay);
+    };
+  }
+
+  function isVideoPage() {
+    return /^https?:\/\/www\.bilibili\.com\/video\//.test(location.href);
   }
 
   function init() {
     let lastUrl = location.href;
 
-    function ensureButton() {
-      if (document.querySelector('.question-btn-wrapper')) return;
-      const actionBar = findActionBar();
-      if (!actionBar) return;
+    ensureButtonDebounced = debounce(() => {
+      if (!isVideoPage()) {
+        if (observer) observer.disconnect();
+        observerTarget = null;
+        return;
+      }
+      injectButton();
+    }, 200);
 
-      injecting = true;
-      const wrapper = document.createElement('div');
-      wrapper.className = 'toolbar-left-item-wrap question-btn-wrapper';
-      const btn = createQuestionButton();
-      wrapper.appendChild(btn);
-      actionBar.appendChild(wrapper);
-      injecting = false;
-      updateCountDisplay();
-    }
-
-    const observer = new MutationObserver(() => {
+    observer = new MutationObserver(() => {
       if (location.href !== lastUrl) {
         lastUrl = location.href;
         currentBvid = null;
-        updateCountDisplay();
+        countDisplayRef = null;
+        const existing = document.querySelector('.question-btn-wrapper');
+        if (existing) existing.remove();
+        observerTarget = null;
+        if (observer) observer.disconnect();
       }
-      ensureButton();
+      ensureButtonDebounced();
     });
-    observer.observe(document.body, { subtree: true, childList: true });
+    observer.observe(document.body, { childList: true, subtree: true });
 
-    ensureButton();
+    ensureButtonDebounced();
   }
 
   if (document.readyState === 'loading') {
